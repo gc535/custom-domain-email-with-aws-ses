@@ -1,0 +1,16 @@
+{
+  "name": "domain-email-send-app",
+  "version": "1.0.0",
+  "description": "Simple web UI to send email via SES SMTP (your custom domain)",
+  "private": true,
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "nodemailer": "^6.9.7"
+  }
+}

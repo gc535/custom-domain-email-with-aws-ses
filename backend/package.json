@@ -1,0 +1,13 @@
+{
+  "name": "custom-domain-email",
+  "version": "1.0.0",
+  "description": "Business email: SES receive → S3 → forward to your inbox; send via client SMTP (e.g. Outlook)",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.967.0",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-ses": "^3.0.0",
+    "mailparser": "^3.6.5"
+  }
+}

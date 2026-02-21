@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Business email for domain: receive via SES→S3, forward to your inbox; send/reply via client SMTP (e.g. Outlook) using SES'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: custom-domain-email
+    Description: Prefix for resource names (lowercase, hyphens; must be valid for S3 bucket naming).
+  DomainName:
+    Type: String
+    Description: Domain used for email (e.g. yourdomain.com). Must be verified in SES.
+  InboxEmail:
+    Type: String
+    Description: Email address to forward received mail to (e.g. you@outlook.com)
+  Region:
+    Type: String
+    Default: us-east-1
+    Description: AWS region (must support SES email receiving, e.g. us-east-1)
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: '(Optional) Route 53 hosted zone ID for your domain. If set, the stack creates the SES domain identity and DKIM CNAME records here so the domain verifies automatically. From deploy/domain stack output.'
+
+Conditions:
+  HasHostedZoneId: !Not [!Equals [!Ref HostedZoneId, '']]
+
+Resources:
+  # Forward-to-inbox Lambda. Uses same bucket name pattern as bucket (no Ref) so no circular dependency.
+  ForwardToInboxFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-email-forward'
+      CodeUri: .
+      Handler: functions/forward-to-inbox/index.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          FORWARD_TO_EMAIL: !Ref InboxEmail
+          DOMAIN_NAME: !Ref DomainName
+          INBOUND_BUCKET: !Sub '${ProjectName}-email-inbound-${AWS::AccountId}'
+          CONFIGURATION_SET_NAME: !Ref SesConfigurationSet
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}/*'
+            - Effect: Allow
+              Action: ses:SendRawEmail
+              Resource: '*'
+
+  # S3 may invoke Lambda. SourceArn uses same name pattern as bucket (no Ref) so permission does not depend on bucket.
+  ForwardToInboxFunctionS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ForwardToInboxFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}'
+
+  # Inbound email bucket; notification triggers Lambda on emails/ prefix. DependsOn permission so S3 validation passes.
+  InboundEmailBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ForwardToInboxFunctionS3Permission
+    Properties:
+      BucketName: !Sub '${ProjectName}-email-inbound-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldEmails
+            Status: Enabled
+            Prefix: emails/
+            ExpirationInDays: 7
+          - Id: DeleteOldBounceComplaints
+            Status: Enabled
+            Prefix: bounce/
+            ExpirationInDays: 90
+          - Id: DeleteOldComplaints
+            Status: Enabled
+            Prefix: complaints/
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ForwardToInboxFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: emails/
+
+  InboundEmailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InboundEmailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSESPuts
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub ['${Arn}/*', { Arn: !GetAtt InboundEmailBucket.Arn }]
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Optional: SES domain identity + Route 53 DKIM records (when HostedZoneId is provided)
+  SesDomainIdentity:
+    Type: AWS::SES::EmailIdentity
+    Condition: HasHostedZoneId
+    Properties:
+      EmailIdentity: !Ref DomainName
+      DkimAttributes:
+        SigningEnabled: true
+
+  SesDkimRecord1:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZoneId
+    DependsOn: SesDomainIdentity
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesDomainIdentity.DkimDNSTokenName1
+      Type: CNAME
+      TTL: 1800
+      ResourceRecords:
+        - !GetAtt SesDomainIdentity.DkimDNSTokenValue1
+
+  SesDkimRecord2:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZoneId
+    DependsOn: SesDomainIdentity
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesDomainIdentity.DkimDNSTokenName2
+      Type: CNAME
+      TTL: 1800
+      ResourceRecords:
+        - !GetAtt SesDomainIdentity.DkimDNSTokenValue2
+
+  SesDkimRecord3:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZoneId
+    DependsOn: SesDomainIdentity
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !GetAtt SesDomainIdentity.DkimDNSTokenName3
+      Type: CNAME
+      TTL: 1800
+      ResourceRecords:
+        - !GetAtt SesDomainIdentity.DkimDNSTokenValue3
+
+  # MX record for receiving (when HostedZoneId provided); points domain to SES inbound
+  InboundMXRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZoneId
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '${DomainName}.'
+      Type: MX
+      TTL: 300
+      ResourceRecords:
+        - !Sub '10 inbound-smtp.${Region}.amazonaws.com.'
+
+  # DMARC (when HostedZoneId provided): p=none = monitor only; rua = aggregate reports to dmarc@domain (ensure that mailbox exists or use an address you read).
+  DmarcRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZoneId
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub '_dmarc.${DomainName}.'
+      Type: TXT
+      TTL: 300
+      ResourceRecords:
+        - !Sub '"v=DMARC1; p=none; rua=mailto:dmarc@${DomainName}"'
+
+  # SES configuration set for bounce/complaint handling (production best practice)
+  SesConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub '${ProjectName}-email-config'
+
+  # SNS topic for bounce and complaint notifications
+  SesBounceComplaintTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-email-bounce-complaint'
+      DisplayName: SES Bounce and Complaint notifications
+
+  SesBounceComplaintTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SesBounceComplaintTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowSESToPublish
+            Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SesBounceComplaintTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # Send bounce and complaint events to SNS
+  SesBounceComplaintEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    DependsOn: SesBounceComplaintTopicPolicy
+    Properties:
+      ConfigurationSetName: !Ref SesConfigurationSet
+      EventDestination:
+        Name: !Sub '${ProjectName}-email-bounce-complaint-sns'
+        Enabled: true
+        MatchingEventTypes:
+          - Bounce
+          - Complaint
+        SnsDestination:
+          TopicARN: !Ref SesBounceComplaintTopic
+
+  # Lambda: store bounce/complaint event payloads in same bucket under bounce/ and complaints/ (book-keeping only, no forwarding)
+  StoreBounceComplaintFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-email-store-bounce-complaint'
+      CodeUri: .
+      Handler: functions/store-bounce-complaint/index.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          BUCKET_NAME: !Sub '${ProjectName}-email-inbound-${AWS::AccountId}'
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}/bounce/*'
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}/complaints/*'
+
+  StoreBounceComplaintPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StoreBounceComplaintFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SesBounceComplaintTopic
+
+  SesBounceComplaintToStoreSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SesBounceComplaintTopic
+      Protocol: lambda
+      Endpoint: !GetAtt StoreBounceComplaintFunction.Arn
+
+  # SES receipt rule set (receive → store in S3 with emails/ prefix)
+  ReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: !Sub '${ProjectName}-email-rules'  # receipt rule set
+
+  ReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn: InboundEmailBucketPolicy
+    Properties:
+      RuleSetName: !Ref ReceiptRuleSet
+      Rule:
+        Name: StoreAndForward
+        Enabled: true
+        Recipients:
+          - !Ref DomainName
+        ScanEnabled: true
+        Actions:
+          - S3Action:
+              BucketName: !Ref InboundEmailBucket
+              ObjectKeyPrefix: emails/
+
+  # Note: CloudFormation has no resource to "activate" a receipt rule set. After deploy,
+  # set this rule set as active in SES Console → Receipt rule sets → select it → Set as active.
+
+Outputs:
+  InboundEmailBucketName:
+    Description: S3 bucket where received emails are stored (raw MIME)
+    Value: !Ref InboundEmailBucket
+    Export:
+      Name: !Sub '${ProjectName}-email-InboundBucket'
+  ForwardToInboxFunctionArn:
+    Description: Lambda that forwards received emails to your inbox
+    Value: !GetAtt ForwardToInboxFunction.Arn
+  ReceiptRuleSetName:
+    Description: SES receipt rule set name. Activate it in SES Console → Receipt rule sets → select this name → Set as active.
+    Value: !Ref ReceiptRuleSet
+  MXRecordValue:
+    Description: MX record value. Created in Route 53 when HostedZoneId was provided; otherwise add this in your DNS.
+    Value: !Sub '10 inbound-smtp.${Region}.amazonaws.com'
+  SpfValue:
+    Description: Add this SPF value to your existing apex TXT record in Route 53 (same record set as Google verification; one TXT can have multiple values).
+    Value: '"v=spf1 include:amazonses.com ~all"'
+  SesDomainVerified:
+    Condition: HasHostedZoneId
+    Description: SES domain, DKIM CNAMEs, DMARC, and MX record were created in Route 53; add SPF to existing apex TXT if needed (see SpfValue output).
+    Value: !Ref SesDomainIdentity
+  SesConfigurationSetName:
+    Description: SES configuration set used for bounce/complaint handling (used by forward Lambda).
+    Value: !Ref SesConfigurationSet
+  SesBounceComplaintTopicArn:
+    Description: SNS topic for bounce and complaint notifications. Events are also stored in the bucket under bounce/ and complaints/ for book-keeping.
+    Value: !Ref SesBounceComplaintTopic

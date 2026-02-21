@@ -1,0 +1,24 @@
+# Local config (never commit real secrets)
+.env
+.env.local
+*.env.local
+
+# Dependencies
+node_modules/
+
+# AWS SAM
+.aws-sam/
+samconfig.toml
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build / cache
+dist/
+.cache/
