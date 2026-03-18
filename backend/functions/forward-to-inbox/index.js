@@ -1,15 +1,17 @@
 /**
- * Lambda: triggered when SES delivers a raw email to S3.
- * Parses the MIME message and forwards it to your inbox (any address).
+ * Lambda: triggered when SES delivers a raw email to S3 (shared bucket, key pattern <domain>/emails/...).
+ * Derives domain from the S3 key, looks up forward-to inbox from SSM /domain-email/inbox/<domain>, then forwards.
  * - From: the address that received the email (e.g. support@domain) so you can sort and reply as that address.
  * - Reply-To: original sender so Reply in your client goes to the right person.
  */
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { SESClient, SendRawEmailCommand } = require('@aws-sdk/client-ses');
+const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 const { simpleParser } = require('mailparser');
 
 const s3 = new S3Client();
 const ses = new SESClient();
+const ssm = new SSMClient();
 
 /** Get the first recipient address that belongs to our domain (To or Cc). */
 function getReceivedAtAddress(parsed, domain) {
@@ -64,14 +66,33 @@ function buildSummaryHtml(parsed) {
   );
 }
 
+/** Derive domain from S3 key: <domain>/emails/<rest> -> domain; skip keys not under <domain>/emails/. */
+function domainFromKey(key) {
+  if (!key || typeof key !== 'string') return null;
+  const parts = key.split('/').filter(Boolean);
+  if (parts.length < 2 || parts[1] !== 'emails') return null;
+  return parts[0];
+}
+
+/** Get forward-to inbox for domain from SSM /domain-email/inbox/<domain> */
+async function getInboxForDomain(domain) {
+  if (!domain) return null;
+  const name = `/domain-email/inbox/${domain}`;
+  try {
+    const { Parameter } = await ssm.send(new GetParameterCommand({ Name: name }));
+    return Parameter?.Value?.trim() || null;
+  } catch (err) {
+    if (err.name === 'ParameterNotFound') return null;
+    throw err;
+  }
+}
+
 exports.handler = async (event) => {
-  const forwardTo = process.env.FORWARD_TO_EMAIL;
-  const domain = process.env.DOMAIN_NAME;
   const bucket = process.env.INBOUND_BUCKET;
   const configurationSetName = process.env.CONFIGURATION_SET_NAME;
 
-  if (!forwardTo || !bucket) {
-    console.error('Missing FORWARD_TO_EMAIL or INBOUND_BUCKET');
+  if (!bucket) {
+    console.error('Missing INBOUND_BUCKET');
     throw new Error('Configuration error');
   }
 
@@ -80,6 +101,18 @@ exports.handler = async (event) => {
 
     const key = decodeURIComponent((record.s3.object?.key || '').replace(/\+/g, ' '));
     if (!key) continue;
+
+    const domain = domainFromKey(key);
+    if (!domain) {
+      console.warn('Skipping key (could not derive domain):', key);
+      continue;
+    }
+
+    const forwardTo = await getInboxForDomain(domain);
+    if (!forwardTo) {
+      console.error('No inbox configured for domain:', domain, '(SSM /domain-email/inbox/<domain>)');
+      throw new Error(`No inbox for domain: ${domain}`);
+    }
 
     try {
       const { Body } = await s3.send(

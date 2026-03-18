@@ -1,7 +1,7 @@
 /**
  * Lambda: subscribed to SNS topic for SES bounce and complaint events.
- * Writes each event payload to the same inbound bucket under bounce/ or complaints/
- * for book-keeping only (no forwarding).
+ * Writes each event payload to the shared bucket under <domain>/bounce/ and <domain>/complaints/
+ * (domain derived from mail.destination) for book-keeping only.
  */
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
 
@@ -9,6 +9,17 @@ const s3 = new S3Client();
 
 function safeKey(str) {
   return (str || '').replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 64) || 'unknown';
+}
+
+/** Extract domain from SES notification mail (first destination address). */
+function domainFromPayload(payload) {
+  const dest = payload.mail?.destination;
+  if (Array.isArray(dest) && dest.length > 0 && typeof dest[0] === 'string') {
+    const addr = dest[0].trim();
+    const at = addr.lastIndexOf('@');
+    if (at > 0) return addr.slice(at + 1).toLowerCase();
+  }
+  return 'unknown';
 }
 
 exports.handler = async (event) => {
@@ -24,7 +35,6 @@ exports.handler = async (event) => {
 
     try {
       const payload = typeof raw === 'string' ? JSON.parse(raw) : raw;
-      // SES uses notificationType (basic) or eventType (event publishing)
       const type = (payload.notificationType || payload.eventType || '').toLowerCase();
       const prefix = type === 'bounce' ? 'bounce' : type === 'complaint' ? 'complaints' : null;
       if (!prefix) {
@@ -32,9 +42,10 @@ exports.handler = async (event) => {
         continue;
       }
 
+      const domain = domainFromPayload(payload);
       const id = payload.bounce?.feedbackId || payload.complaint?.feedbackId || payload.mail?.messageId || record.Sns.MessageId;
       const ts = payload.mail?.timestamp || payload.bounce?.timestamp || payload.complaint?.timestamp || new Date().toISOString();
-      const key = `${prefix}/${ts.replace(/[:.]/g, '-')}-${safeKey(id)}.json`;
+      const key = `${domain}/${prefix}/${ts.replace(/[:.]/g, '-')}-${safeKey(id)}.json`;
 
       await s3.send(
         new PutObjectCommand({

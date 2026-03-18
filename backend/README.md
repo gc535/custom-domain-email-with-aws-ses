@@ -9,13 +9,16 @@ This backend implements basic custom-domain email with AWS SES:
 
 ```
   Inbound:
-  Internet → MX (your domain) → SES (receive) → S3 (raw MIME) → Lambda → forward to your inbox
+  Internet → MX (your domain) → SES (receive) → S3 (raw MIME, per-domain folder) → Lambda → forward to your inbox
 
   Outbound:
   Your client app (SES SMTP configured) OR send app (../app) → SES → recipient sees From: you@yourdomain.com
 ```
 
-**Stack:** S3 bucket (inbound mail + bounce/complaint storage), Lambda (forward-to-inbox, store-bounce-complaint), SES receipt rule set. Config from project root `.env`.
+**Multi-domain:** You can deploy this project for mutiple domains. Just repeat the steps in **deploy section**. For multi-domain deployemnt, email storage S3 bucket and SES receipt RuleSet(per-region) will be **shared**. 
+Bucket: `custom-domain-email-inbound-<account-id>`. 
+Bucket layout: `<domain>/emails/`, `<domain>/bounce/`, `<domain>/complaints/`. 
+Rule set: `custom-domain-email-rules`. 
 
 ## Prerequisites
 
@@ -42,17 +45,16 @@ Copy the project root `.env.example` to `.env` and set at least:
    ```
 
 3. **If you did not set HOSTED_ZONE_ID:** Add the **MX** record in your DNS so mail is delivered to SES:
-   - **Name:** your domain (or `@`).
    - **Type:** MX  
    - **Value:** `10 inbound-smtp.<region>.amazonaws.com` (e.g. `10 inbound-smtp.us-east-1.amazonaws.com`).
 
    Then in **SES** → **Email receiving** → **Receipt rule sets**, set the stack’s rule set as **active**.
 
-4. **If you set HOSTED_ZONE_ID:** The stack creates the MX record and activates the rule set; wait for DNS propagation.
+4. **Activate the rule set once:** In **SES** → **Email receiving** → **Receipt rule sets**, set **custom-domain-email-rules** as active.
 
 ## Backend storage
 
-One S3 bucket (inbound + events), keyed by prefix:
+One shared S3 bucket per account/region. Per-domain layout:
 
-- **`emails/`** – Raw inbound mail (MIME). Lambda reads from here and forwards to your inbox; lifecycle deletes after 7 days.
-- **`bounce/`** and **`complaints/`** – SES bounce and complaint event payloads (stored by the store-bounce-complaint Lambda for book-keeping); lifecycle deletes after 90 days.
+- **`<domain>/emails/`** – Raw inbound mail (MIME). Lambda forwards to the inbox stored in SSM for that domain; lifecycle deletes after 7 days (first domain only; add lifecycle rules in console for additional domains if desired).
+- **`<domain>/bounce/`** and **`<domain>/complaints/`** – SES bounce/complaint payloads; lifecycle deletes after 90 days (first domain only).

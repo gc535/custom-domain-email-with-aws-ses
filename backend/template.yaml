@@ -1,12 +1,12 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: 'Business email for domain: receive via SES→S3, forward to your inbox; send/reply via client SMTP (e.g. Outlook) using SES'
+Description: 'Business email for domain: receive via SES→S3, forward to your inbox; send/reply via client SMTP (e.g. Outlook) using SES. First deploy creates shared bucket + rule set; subsequent deploys add this domain to the same bucket and rule set.'
 
 Parameters:
   ProjectName:
     Type: String
     Default: custom-domain-email
-    Description: Prefix for resource names (lowercase, hyphens; must be valid for S3 bucket naming).
+    Description: Prefix for resource names (lowercase, hyphens; used for SSM path and optional naming).
   DomainName:
     Type: String
     Description: Domain used for email (e.g. yourdomain.com). Must be verified in SES.
@@ -21,64 +21,41 @@ Parameters:
     Type: String
     Default: ''
     Description: '(Optional) Route 53 hosted zone ID for your domain. If set, the stack creates the SES domain identity and DKIM CNAME records here so the domain verifies automatically. From deploy/domain stack output.'
+  CreateSharedResources:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Set by deploy script from probe (bucket exists or not). true = create shared bucket and rule set; false = only add this domain.
 
 Conditions:
   HasHostedZoneId: !Not [!Equals [!Ref HostedZoneId, '']]
+  CreateSharedResources: !Equals [!Ref CreateSharedResources, 'true']
+  IsAdditionalDomain: !Not [!Condition CreateSharedResources]
 
 Resources:
-  # Forward-to-inbox Lambda. Uses same bucket name pattern as bucket (no Ref) so no circular dependency.
-  ForwardToInboxFunction:
-    Type: AWS::Serverless::Function
-    Properties:
-      FunctionName: !Sub '${ProjectName}-email-forward'
-      CodeUri: .
-      Handler: functions/forward-to-inbox/index.handler
-      Runtime: nodejs20.x
-      Timeout: 30
-      MemorySize: 256
-      Environment:
-        Variables:
-          FORWARD_TO_EMAIL: !Ref InboxEmail
-          DOMAIN_NAME: !Ref DomainName
-          INBOUND_BUCKET: !Sub '${ProjectName}-email-inbound-${AWS::AccountId}'
-          CONFIGURATION_SET_NAME: !Ref SesConfigurationSet
-      Policies:
-        - Statement:
-            - Effect: Allow
-              Action: s3:GetObject
-              Resource: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}/*'
-            - Effect: Allow
-              Action: ses:SendRawEmail
-              Resource: '*'
+  # --- Shared resources (created only on first deployment when SharedInboundBucketName and SharedReceiptRuleSetName are empty) ---
 
-  # S3 may invoke Lambda. SourceArn uses same name pattern as bucket (no Ref) so permission does not depend on bucket.
-  ForwardToInboxFunctionS3Permission:
-    Type: AWS::Lambda::Permission
-    Properties:
-      FunctionName: !Ref ForwardToInboxFunction
-      Action: lambda:InvokeFunction
-      Principal: s3.amazonaws.com
-      SourceArn: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}'
-
-  # Inbound email bucket; notification triggers Lambda on emails/ prefix. DependsOn permission so S3 validation passes.
+  # Single shared inbound bucket for all domains. Layout: <domain>/emails/, <domain>/bounce/, <domain>/complaints/
   InboundEmailBucket:
     Type: AWS::S3::Bucket
-    DependsOn: ForwardToInboxFunctionS3Permission
+    Condition: CreateSharedResources
     Properties:
-      BucketName: !Sub '${ProjectName}-email-inbound-${AWS::AccountId}'
+      BucketName: !Sub 'custom-domain-email-inbound-${AWS::AccountId}'
       LifecycleConfiguration:
         Rules:
-          - Id: DeleteOldEmails
+          - Id: DeleteOldEmailsFirstDomain
             Status: Enabled
-            Prefix: emails/
+            Prefix: !Sub '${DomainName}/emails/'
             ExpirationInDays: 7
-          - Id: DeleteOldBounceComplaints
+          - Id: DeleteOldBounceFirstDomain
             Status: Enabled
-            Prefix: bounce/
+            Prefix: !Sub '${DomainName}/bounce/'
             ExpirationInDays: 90
-          - Id: DeleteOldComplaints
+          - Id: DeleteOldComplaintsFirstDomain
             Status: Enabled
-            Prefix: complaints/
+            Prefix: !Sub '${DomainName}/complaints/'
             ExpirationInDays: 90
       PublicAccessBlockConfiguration:
         BlockPublicAcls: true
@@ -89,14 +66,10 @@ Resources:
         LambdaConfigurations:
           - Event: s3:ObjectCreated:*
             Function: !GetAtt ForwardToInboxFunction.Arn
-            Filter:
-              S3Key:
-                Rules:
-                  - Name: prefix
-                    Value: emails/
 
   InboundEmailBucketPolicy:
     Type: AWS::S3::BucketPolicy
+    Condition: CreateSharedResources
     Properties:
       Bucket: !Ref InboundEmailBucket
       PolicyDocument:
@@ -111,6 +84,43 @@ Resources:
             Condition:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
+
+  # Single forward Lambda for all domains: reads domain from S3 key (<domain>/emails/...), looks up inbox from SSM /domain-email/inbox/<domain>.
+  # Uses fixed bucket name (no Ref) to avoid circular dependency with InboundEmailBucket which references this Lambda in its notification.
+  ForwardToInboxFunction:
+    Type: AWS::Serverless::Function
+    Condition: CreateSharedResources
+    Properties:
+      FunctionName: custom-domain-email-forward
+      CodeUri: .
+      Handler: functions/forward-to-inbox/index.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          INBOUND_BUCKET: !Sub 'custom-domain-email-inbound-${AWS::AccountId}'
+          CONFIGURATION_SET_NAME: !Ref SesConfigurationSet
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetObject
+              Resource: !Sub 'arn:aws:s3:::custom-domain-email-inbound-${AWS::AccountId}/*'
+            - Effect: Allow
+              Action: ses:SendRawEmail
+              Resource: '*'
+            - Effect: Allow
+              Action: ssm:GetParameter
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/domain-email/inbox/*'
+
+  ForwardToInboxFunctionS3Permission:
+    Type: AWS::Lambda::Permission
+    Condition: CreateSharedResources
+    Properties:
+      FunctionName: !Ref ForwardToInboxFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::custom-domain-email-inbound-${AWS::AccountId}'
 
   # Optional: SES domain identity + Route 53 DKIM records (when HostedZoneId is provided)
   SesDomainIdentity:
@@ -181,21 +191,24 @@ Resources:
       ResourceRecords:
         - !Sub '"v=DMARC1; p=none; rua=mailto:dmarc@${DomainName}"'
 
-  # SES configuration set for bounce/complaint handling (production best practice)
+  # SES configuration set for bounce/complaint handling (shared, one per region)
   SesConfigurationSet:
     Type: AWS::SES::ConfigurationSet
+    Condition: CreateSharedResources
     Properties:
-      Name: !Sub '${ProjectName}-email-config'
+      Name: custom-domain-email-config
 
-  # SNS topic for bounce and complaint notifications
+  # SNS topic for bounce and complaint notifications (shared)
   SesBounceComplaintTopic:
     Type: AWS::SNS::Topic
+    Condition: CreateSharedResources
     Properties:
-      TopicName: !Sub '${ProjectName}-email-bounce-complaint'
+      TopicName: custom-domain-email-bounce-complaint
       DisplayName: SES Bounce and Complaint notifications
 
   SesBounceComplaintTopicPolicy:
     Type: AWS::SNS::TopicPolicy
+    Condition: CreateSharedResources
     Properties:
       Topics:
         - !Ref SesBounceComplaintTopic
@@ -212,14 +225,14 @@ Resources:
               StringEquals:
                 aws:SourceAccount: !Ref AWS::AccountId
 
-  # Send bounce and complaint events to SNS
   SesBounceComplaintEventDestination:
     Type: AWS::SES::ConfigurationSetEventDestination
+    Condition: CreateSharedResources
     DependsOn: SesBounceComplaintTopicPolicy
     Properties:
       ConfigurationSetName: !Ref SesConfigurationSet
       EventDestination:
-        Name: !Sub '${ProjectName}-email-bounce-complaint-sns'
+        Name: custom-domain-email-bounce-complaint-sns
         Enabled: true
         MatchingEventTypes:
           - Bounce
@@ -227,11 +240,13 @@ Resources:
         SnsDestination:
           TopicARN: !Ref SesBounceComplaintTopic
 
-  # Lambda: store bounce/complaint event payloads in same bucket under bounce/ and complaints/ (book-keeping only, no forwarding)
+  # Lambda: store bounce/complaint payloads in shared bucket under <domain>/bounce/ and <domain>/complaints/
+  # Uses fixed bucket name (no Ref) to avoid circular dependency with InboundEmailBucket.
   StoreBounceComplaintFunction:
     Type: AWS::Serverless::Function
+    Condition: CreateSharedResources
     Properties:
-      FunctionName: !Sub '${ProjectName}-email-store-bounce-complaint'
+      FunctionName: custom-domain-email-store-bounce-complaint
       CodeUri: .
       Handler: functions/store-bounce-complaint/index.handler
       Runtime: nodejs20.x
@@ -239,18 +254,16 @@ Resources:
       MemorySize: 128
       Environment:
         Variables:
-          BUCKET_NAME: !Sub '${ProjectName}-email-inbound-${AWS::AccountId}'
+          BUCKET_NAME: !Sub 'custom-domain-email-inbound-${AWS::AccountId}'
       Policies:
         - Statement:
             - Effect: Allow
               Action: s3:PutObject
-              Resource: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}/bounce/*'
-            - Effect: Allow
-              Action: s3:PutObject
-              Resource: !Sub 'arn:aws:s3:::${ProjectName}-email-inbound-${AWS::AccountId}/complaints/*'
+              Resource: !Sub 'arn:aws:s3:::custom-domain-email-inbound-${AWS::AccountId}/*'
 
   StoreBounceComplaintPermission:
     Type: AWS::Lambda::Permission
+    Condition: CreateSharedResources
     Properties:
       FunctionName: !Ref StoreBounceComplaintFunction
       Action: lambda:InvokeFunction
@@ -259,48 +272,83 @@ Resources:
 
   SesBounceComplaintToStoreSubscription:
     Type: AWS::SNS::Subscription
+    Condition: CreateSharedResources
     Properties:
       TopicArn: !Ref SesBounceComplaintTopic
       Protocol: lambda
       Endpoint: !GetAtt StoreBounceComplaintFunction.Arn
 
-  # SES receipt rule set (receive → store in S3 with emails/ prefix)
+  # Single receipt rule set for the region (only one can be active). Created on first deployment.
   ReceiptRuleSet:
     Type: AWS::SES::ReceiptRuleSet
+    Condition: CreateSharedResources
     Properties:
-      RuleSetName: !Sub '${ProjectName}-email-rules'  # receipt rule set
+      RuleSetName: custom-domain-email-rules
 
+  # This domain's inbox → stored in SSM so the shared forward Lambda can look it up. Always created/updated per domain.
+  DomainInboxParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/domain-email/inbox/${DomainName}'
+      Type: String
+      Value: !Ref InboxEmail
+      Description: !Sub 'Forward-to address for domain ${DomainName}'
+
+  # Add this domain to the shared receipt rule set (fixed name: custom-domain-email-rules).
+  # Two resources are used so we don't reference a conditional dependency when adding additional domains.
   ReceiptRule:
     Type: AWS::SES::ReceiptRule
+    Condition: CreateSharedResources
     DependsOn: InboundEmailBucketPolicy
     Properties:
-      RuleSetName: !Ref ReceiptRuleSet
+      RuleSetName: custom-domain-email-rules
       Rule:
-        Name: StoreAndForward
+        Name: !Sub 'StoreAndForward-${DomainName}'
         Enabled: true
         Recipients:
           - !Ref DomainName
         ScanEnabled: true
         Actions:
           - S3Action:
-              BucketName: !Ref InboundEmailBucket
-              ObjectKeyPrefix: emails/
+              BucketName: !Sub 'custom-domain-email-inbound-${AWS::AccountId}'
+              ObjectKeyPrefix: !Sub '${DomainName}/emails/'
 
-  # Note: CloudFormation has no resource to "activate" a receipt rule set. After deploy,
-  # set this rule set as active in SES Console → Receipt rule sets → select it → Set as active.
+  ReceiptRuleAdditionalDeploy:
+    Type: AWS::SES::ReceiptRule
+    Condition: IsAdditionalDomain
+    Properties:
+      RuleSetName: custom-domain-email-rules
+      Rule:
+        Name: !Sub 'StoreAndForward-${DomainName}'
+        Enabled: true
+        Recipients:
+          - !Ref DomainName
+        ScanEnabled: true
+        Actions:
+          - S3Action:
+              BucketName: !Sub 'custom-domain-email-inbound-${AWS::AccountId}'
+              ObjectKeyPrefix: !Sub '${DomainName}/emails/'
+
+  # Note: CloudFormation has no resource to "activate" a receipt rule set. After the first deploy,
+  # set "custom-domain-email-rules" as active in SES Console → Receipt rule sets → Set as active.
 
 Outputs:
   InboundEmailBucketName:
-    Description: S3 bucket where received emails are stored (raw MIME)
-    Value: !Ref InboundEmailBucket
+    Description: Shared S3 bucket (fixed name). All domains use this same bucket.
+    Condition: CreateSharedResources
+    Value: !Sub 'custom-domain-email-inbound-${AWS::AccountId}'
     Export:
-      Name: !Sub '${ProjectName}-email-InboundBucket'
-  ForwardToInboxFunctionArn:
-    Description: Lambda that forwards received emails to your inbox
-    Value: !GetAtt ForwardToInboxFunction.Arn
+      Name: domain-email-InboundBucket
   ReceiptRuleSetName:
-    Description: SES receipt rule set name. Activate it in SES Console → Receipt rule sets → select this name → Set as active.
-    Value: !Ref ReceiptRuleSet
+    Description: Shared receipt rule set (fixed name). Set as active in SES Console once; all domains use it.
+    Condition: CreateSharedResources
+    Value: custom-domain-email-rules
+    Export:
+      Name: domain-email-ReceiptRuleSetName
+  ForwardToInboxFunctionArn:
+    Description: Lambda that forwards received emails (shared; only created on first deploy)
+    Condition: CreateSharedResources
+    Value: !GetAtt ForwardToInboxFunction.Arn
   MXRecordValue:
     Description: MX record value. Created in Route 53 when HostedZoneId was provided; otherwise add this in your DNS.
     Value: !Sub '10 inbound-smtp.${Region}.amazonaws.com'
@@ -312,8 +360,10 @@ Outputs:
     Description: SES domain, DKIM CNAMEs, DMARC, and MX record were created in Route 53; add SPF to existing apex TXT if needed (see SpfValue output).
     Value: !Ref SesDomainIdentity
   SesConfigurationSetName:
+    Condition: CreateSharedResources
     Description: SES configuration set used for bounce/complaint handling (used by forward Lambda).
     Value: !Ref SesConfigurationSet
   SesBounceComplaintTopicArn:
+    Condition: CreateSharedResources
     Description: SNS topic for bounce and complaint notifications. Events are also stored in the bucket under bounce/ and complaints/ for book-keeping.
     Value: !Ref SesBounceComplaintTopic
