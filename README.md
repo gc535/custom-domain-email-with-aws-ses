@@ -1,4 +1,4 @@
-# Business Email for Your Domain
+# Free ➕ Unlimited Business Email for Your Domain
 
 A simple, free custom-domain email setup using **Amazon AWS** so you can send and reply with addresses like `support@yourdomain.com`. Stack: **SES + S3 + Lambda + SNS**.
 
